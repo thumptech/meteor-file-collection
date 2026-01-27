@@ -12,13 +12,16 @@
 //###########################################################################
 
 import {WebApp} from "meteor/webapp";
-import gridLocks from './gridfs-locks';
 
-import grid from './gridfs-locking-stream';
+import express from 'express'
+
+import {MongoClient, ObjectId, GridFSBucket} from 'mongodb';
+
+import {Mongo} from 'meteor/mongo';
+
 
 if (Meteor.isServer) {
 
-    const express = Npm.require('express');
     const cookieParser = Npm.require('cookie-parser');
 
     const Dicer = Npm.require('dicer');
@@ -138,11 +141,9 @@ if (Meteor.isServer) {
     };
 
     // Handle a generic HTTP POST file upload
-
     // This curl command should be properly handled by this code:
     // % curl -X POST 'http://127.0.0.1:3000/gridfs/fs/38a14c8fef2d6cef53c70792' \
     //        -F 'file=@"universe.png";type=image/png' -H 'X-Auth-Token: zrtrotHrDzwA4nC5'
-
     const post = function (req, res, next) {
         // Handle filename or filetype data when included
         if (req.multipart.fileType) {
@@ -174,8 +175,7 @@ if (Meteor.isServer) {
     // Handle a generic HTTP GET request
     // This also handles HEAD requests
     // If the request URL has a "?download=true" query, then a browser download response is triggered
-
-    const get = function (req, res, next) {
+    const get = async function (req, res, next) {
         let end, statusCode, stream;
         const headers = {};
         for (let h in share.defaultResponseHeaders) {
@@ -198,7 +198,7 @@ if (Meteor.isServer) {
 
         // If range request in the header
         if (req.headers['range']) {
-// Set status code to partial data
+            // Set status code to partial data
             statusCode = 206;
 
             // Pick out the range required by the browser
@@ -226,20 +226,14 @@ if (Meteor.isServer) {
 
             // Read the partial request from gridfs stream
             if (req.method !== 'HEAD') {
-                stream = this.findOneStream(
-                    {_id: req.gridFS._id}
-                    , {
-                        range: {
-                            start,
-                            end
-                        }
-                    }
+                stream = await this.findOneStream(
+                    {_id: req.gridFS._id}, {range: {start, end}}
                 );
             }
-
-// Otherwise prepare to stream the whole file
-        } else {
-// Set default status code
+        }
+        // Otherwise prepare to stream the whole file
+        else {
+            // Set default status code
             statusCode = 200;
 
             // Set default headers
@@ -248,10 +242,10 @@ if (Meteor.isServer) {
             headers['Content-Length'] = req.gridFS.length;
             headers['Last-Modified'] = req.gridFS.uploadDate.toUTCString();
 
-
             // Open file to stream
             if (req.method !== 'HEAD') {
-                stream = this.findOneStream({_id: req.gridFS._id});
+
+                stream = await this.findOneStream({_id:req.gridFS._id});
             }
         }
 
@@ -273,9 +267,8 @@ if (Meteor.isServer) {
             return;
         }
 
-        // Stream file
-        if (stream) {
 
+        if (stream) {
             //d41d8cd98f00b204e9800998ecf8427e empty file
             headers['Content-MD5'] = headers['Content-MD5'] || 'd41d8cd98f00b204e9800998ecf8427e';
             res.writeHead(statusCode, headers);
@@ -339,17 +332,17 @@ if (Meteor.isServer) {
     const build_access_point = function (http) {
 
         // Loop over the app supplied http paths
-        for (let r of Array.from(http)) {
+        for (const route of Array.from(http)) {
 
-            if (r.method.toUpperCase() === 'POST') {
-                this.router.post(r.path, dice_multipart);
+            if (route.method.toUpperCase() === 'POST') {
+                this.router.post(route.path, dice_multipart);
             }
 
             // Add an express middleware for each application REST path
-            this.router[r.method](r.path, (r => {
-                    return (req, res, next) => {
-
-                        // params and queries literally named "_id" get converted to ObjectIDs automatically
+            this.router[route.method](route.path, (args => {
+                    return async (req, res, next) => {
+                        //console.log('build_access_point', req.params, req.query, args);
+                       // // params and queries literally named "_id" get converted to ObjectIDs automatically
                         if (req.params?._id != null) {
                             req.params._id = share.safeObjectID(req.params._id);
                         }
@@ -358,7 +351,7 @@ if (Meteor.isServer) {
                         }
 
                         // Build the path lookup mongoDB query object for the gridFS files collection
-                        const lookup = r.lookup?.bind(this)(req.params || {}, req.query || {}, req.multipart);
+                        const lookup = await args.lookup.bind(this)(req.params || {}, req.query || {}, req.multipart);
                         if (lookup == null) {
                             // No lookup returned, so bailing
                             res.writeHead(500, share.defaultResponseHeaders);
@@ -366,11 +359,16 @@ if (Meteor.isServer) {
                         } else {
                             // Perform the collection query
                             let opts;
-                            req.gridFS = this.findOne(lookup);
+                            req.gridFS = await this.findOneAsync(lookup);
                             if (!req.gridFS) {
+                                console.log('req.gridFS not found', lookup);
                                 res.writeHead(404, share.defaultResponseHeaders);
                                 res.end();
                                 return;
+                            }else{
+                                //console.log('found req.gridFS', req.gridFS);
+                                //confirmed we are getting the file, problem getting stream
+                                //https://www.mongodb.com/community/forums/t/unable-to-fetch-data-from-gridfs-when-the-api-is-getting-called-no-response-or-error-shown-working-on-this-for-last-few-weeks-have-tried-everything-that-is-possible-but-the-result-is-same/228172/3
                             }
 
                             // Make sure that the requested method is permitted for this file in the allow/deny rules
@@ -432,17 +430,17 @@ if (Meteor.isServer) {
                             return next();
                         }
                     };
-                })(r)
+                })(route)
             );
 
             // Add an express middleware for each custom request handler
-            if (typeof r.handler === 'function') {
-                this.router[r.method](r.path, r.handler.bind(this));
+            if (typeof route.handler === 'function') {
+                this.router[route.method](route.path, route.handler.bind(this));
             }
         }
 
         // Add all of generic request handling methods to the express route
-        return this.router.route('/*')
+        return this.router.route('/*path')
             .all(function (req, res, next) {   // There needs to be a valid req.gridFS object here
                 if (req.gridFS != null) {
                     next();
@@ -464,8 +462,8 @@ if (Meteor.isServer) {
 
     // Performs a meteor userId lookup by hashed access token
 
-    const lookup_userId_by_token = function (authToken) {
-        const userDoc = Meteor.users?.findOne({
+    const lookup_userId_by_token = async function (authToken) {
+        const userDoc = await Meteor.users?.findOneAsync({
             'services.resume.loginTokens': {
                 $elemMatch: {
                     hashedToken: Accounts?._hashLoginToken(authToken)
@@ -478,17 +476,17 @@ if (Meteor.isServer) {
     // Express middleware to convert a Meteor access token provided in an HTTP request
     // to a Meteor userId attached to the request object as req.meteorUserId
 
-    const handle_auth = function (req, res, next) {
+    const handle_auth = async function (req, res, next) {
         if (req.meteorUserId == null) {
             // Lookup userId if token is provided in HTTP header
             if (req.headers?.['x-auth-token'] != null ||
                 req.cookies?.['X-Auth-Token'] != null
             ) {
-                if(req.headers['x-auth-token'])
-                    req.meteorUserId = lookup_userId_by_token(req.headers['x-auth-token']);
+                if (req.headers['x-auth-token'])
+                    req.meteorUserId = await lookup_userId_by_token(req.headers['x-auth-token']);
                 // Or as a URL query of the same name
-                else if(req.cookies['X-Auth-Token'])
-                    req.meteorUserId = lookup_userId_by_token(req.cookies['X-Auth-Token']);
+                else if (req.cookies['X-Auth-Token'])
+                    req.meteorUserId = await lookup_userId_by_token(req.cookies['X-Auth-Token']);
             } else {
                 req.meteorUserId = null;
             }
@@ -519,11 +517,11 @@ if (Meteor.isServer) {
 
         // Don't setup any middleware unless there are routes defined
         if (options.http?.length > 0) {
-            const r = express.Router();
-            r.use(express.query()); // Parse URL query strings
-            r.use(cookieParser()); // Parse cookies
-            r.use(handle_auth); // Turn x-auth-tokens into Meteor userIds
-            WebApp.rawConnectHandlers.use(this.baseURL, share.bind_env(r));
+            const router = express.Router();
+            //router.use(express.query()); // Parse URL query strings
+            router.use(cookieParser()); // Parse cookies
+            router.use(handle_auth); // Turn x-auth-tokens into Meteor userIds
+            WebApp.rawConnectHandlers.use(this.baseURL, share.bind_env(router));
 
             // Setup application HTTP REST interface
             this.router = express.Router();

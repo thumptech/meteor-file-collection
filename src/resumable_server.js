@@ -1,31 +1,23 @@
-/*
- * decaffeinate suggestions:
- * DS102: Remove unnecessary code created because of implicit returns
- * Full docs: https://github.com/decaffeinate/decaffeinate/blob/main/docs/suggestions.md
- */
 //###########################################################################
 //     Copyright (C) 2014-2017 by Vaughn Iverson
 //     fileCollection is free software released under the MIT/X11 license.
 //     See included LICENSE file for details.
 //###########################################################################
 
+//import {Mongo, MongoInternals} from 'meteor/mongo';
+
+import {MongoClient, ObjectId, GridFSBucket} from 'mongodb';
+import async from 'async';
 
 if (Meteor.isServer) {
-
-    // const express = Npm.require('express');
-    const mongodb = Npm.require('mongodb');
-
-    //const dicer = Npm.require('dicer');
-    const async = Npm.require('async');
-
     // This function checks to see if all of the parts of a Resumable.js uploaded file are now in the gridFS
     // Collection. If so, it completes the file by moving all of the chunks to the correct file and cleans up
     const check_order = function (file, callback) {
-        const fileId = mongodb.ObjectID(`${file.metadata._Resumable.resumableIdentifier}`);
 
+        //const fileId = new Mongo.ObjectID(file.metadata._Resumable.resumableIdentifier);
+        const fileId = new ObjectId(file._id.toHexString());
         const files = this.db.collection(`${this.root}.files`);
         const main = this.db.collection(`${this.root}`);
-
         const query = {
             'metadata._Resumable.resumableIdentifier': file.metadata._Resumable.resumableIdentifier,
             length: {
@@ -44,10 +36,9 @@ if (Meteor.isServer) {
                 }
             }
         );
+        //console.log("check_order: got files cursor", cursor);
 
-        files.countDocuments(query, {}, (err, count) => {
-            if (err) return callback(err);
-
+        files.countDocuments(query).then(count => {
             if (!(count >= 1)) {
                 cursor.close();
                 return callback();
@@ -63,33 +54,40 @@ if (Meteor.isServer) {
 
             cursor.batchSize(file.metadata._Resumable.resumableTotalChunks + 1);
 
-            cursor.toArray((err, parts) => {
-
-                if (err) return callback(err);
-
+            cursor.toArray().then(parts => {
                 async.eachLimit(parts, 5,
                     (part, cb) => {
-                        if (err) {
-                            console.error("Error from cursor.next()", err);
-                            cb(err);
-                        }
                         if (!part) {
                             return cb(new Meteor.Error("Received null part"));
                         }
-                        const partId = mongodb.ObjectID(`${part._id}`);
-
+                        const partId = part._id;
                         async.series([
                                 // Move the chunks to the correct file
-                                cb => chunks.updateMany({files_id: partId, n: 0},
-                                    {
+                                cb => {
+                                    chunks.updateMany({
+                                        files_id: partId,
+                                        n: 0
+                                    }, {
                                         $set: {
                                             files_id: fileId,
                                             n: part.metadata._Resumable.resumableChunkNumber - 1
                                         }
-                                    },
-                                    cb),
+                                    })
+                                        .then(res => {
+                                            cb()
+                                        })
+                                        .catch(err => cb(err));
+                                },
                                 // Delete the temporary chunk file documents
-                                cb => files.deleteOne({_id: partId}, cb)
+                                cb => {
+                                    files.deleteOne({
+                                        _id: partId
+                                    })
+                                        .then(res => {
+                                            cb();
+                                        })
+                                        .catch(err => cb(err));
+                                }
                             ],
                             (err, res) => {
                                 if (err) {
@@ -99,36 +97,38 @@ if (Meteor.isServer) {
                                     return cb();
                                 } else {
                                     // check for a final hanging gridfs chunk
-                                    return chunks.updateMany({files_id: partId, n: 1},
+                                    chunks.updateMany({files_id: partId, n: 1},
                                         {
                                             $set: {
                                                 files_id: fileId,
                                                 n: part.metadata._Resumable.resumableChunkNumber
                                             }
-                                        },
-                                        function (err, res) {
-                                            if (err) {
-                                                return cb(err);
-                                            }
-                                            return cb();
-                                        });
+                                        }
+                                    ).then(res => {
+                                        cb()
+                                    });
                                 }
                             });
-
                     },
                     err => {
                         if (err) return callback(err);
                         // Update the size, this will trigger md5 generation in gridFS_server.js
-                        return files.updateOne({_id: fileId}, {
+                        files.updateOne({_id: fileId}, {
                                 $set: {
                                     length: file.metadata._Resumable.resumableTotalSize,
                                 }
                             },
-                            err => callback(err)
-                        );
+                        ).then(res => {
+                           // console.log(`...done`, res);
+                            callback();
+                        }).catch(err => callback(err));
 
                     });
+            }).catch(err => {
+                return callback(err);
             });
+        }).catch(err => {
+            return callback(err);
         });
 
     };
@@ -141,7 +141,7 @@ if (Meteor.isServer) {
         }
     };
 
-    const resumable_post_handler = function (req, res, next) {
+    const resumable_post_handler = async function (req, res, next) {
         // This has to be a resumable POST
         if (!req.multipart?.params?.resumableIdentifier) {
             console.error("Missing resumable.js multipart information");
@@ -159,6 +159,7 @@ if (Meteor.isServer) {
 
         if (req.maxUploadSize > 0) {
             if (!(resumable.resumableTotalSize <= req.maxUploadSize)) {
+                console.error("Resumable.js upload size exceeds maxUploadSize");
                 res.writeHead(413, share.defaultResponseHeaders);
                 res.end();
                 return;
@@ -172,7 +173,7 @@ if (Meteor.isServer) {
                 (resumable.resumableCurrentChunkSize !== resumable.resumableChunkSize)) &&
             ((resumable.resumableChunkNumber !== resumable.resumableTotalChunks) ||
                 (!(resumable.resumableCurrentChunkSize < (2 * resumable.resumableChunkSize))))) {
-
+            console.error("Invalid chunk sizes");
             res.writeHead(501, share.defaultResponseHeaders);
             res.end();
             return;
@@ -185,11 +186,11 @@ if (Meteor.isServer) {
         };
 
         // This is to handle duplicate chunk uploads in case of network weirdness
-        const findResult = this.findOne(chunkQuery, {fields: {_id: 1}});
+        const findResult = await this.findOneAsync(chunkQuery, {fields: {_id: 1}});
 
         if (findResult) {
             // Duplicate chunk... Don't rewrite it.
-            // console.warn "Duplicate chunk detected: #{resumable.resumableChunkNumber}, #{resumable.resumableIdentifier}"
+            console.warn(`Duplicate chunk detected: ${resumable.resumableChunkNumber}, ${resumable.resumableIdentifier}`);
             res.writeHead(200, share.defaultResponseHeaders);
             return res.end();
         } else {
@@ -201,6 +202,7 @@ if (Meteor.isServer) {
             });
 
             if (!writeStream) {
+                console.error("Error writing chunk to gridFS");
                 res.writeHead(404, share.defaultResponseHeaders);
                 res.end();
                 return;
@@ -230,7 +232,7 @@ if (Meteor.isServer) {
     // This handles Resumable.js "test GET" requests, that exist to determine
     // if a part is already uploaded. It also handles HEAD requests, which
     // should be a bit more efficient and resumable.js now supports
-    const resumable_get_handler = function (req, res, next) {
+    const resumable_get_handler = async function (req, res, next) {
         const {
             query
         } = req;
@@ -248,7 +250,7 @@ if (Meteor.isServer) {
             ]
         };
 
-        const result = this.findOne(chunkQuery, {fields: {_id: 1}});
+        const result = await this.findOneAsync(chunkQuery, {fields: {_id: 1}});
         if (result) {
             // Chunk is present
             res.writeHead(200, share.defaultResponseHeaders);

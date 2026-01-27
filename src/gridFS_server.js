@@ -13,18 +13,17 @@
 //###########################################################################
 import {Meteor} from 'meteor/meteor'
 import {Mongo, MongoInternals} from 'meteor/mongo';
+import grid from './gridfs-locking-stream';
+import crypto from "crypto";
 
 //const mongodb = Npm.require('mongodb');
-const {MongoClient} = require("mongodb");
+//const {MongoClient} = require("mongodb");
 
-import grid from './gridfs-locking-stream';
+import {MongoClient, ObjectId, GridFSBucket} from 'mongodb';
 
-const ObjectID = require("bson-objectid");
 
 const fs = Npm.require('fs');
 const path = Npm.require('path');
-
-import crypto from "crypto";
 
 //Keep track of the chunks received so the md5 generation can be fired ONLY when the file has completed uploading
 const chunksReceived = {};
@@ -51,7 +50,7 @@ export class FileCollection extends Mongo.Collection {
         super(root + '.files', {idGeneration: 'MONGO'});
         this.root = root;
 
-        this.bucket = new MongoInternals.NpmModule.GridFSBucket(
+        this.bucket = new GridFSBucket(
             MongoInternals.defaultRemoteCollectionDriver().mongo.db,
             {bucketName: this.root}
         );
@@ -71,10 +70,8 @@ export class FileCollection extends Mongo.Collection {
         //process.env.MONGO_URL =  mongodb://127.0.0.1:27017/panda, we only need the first part before panda
         const client = new MongoClient(process.env.MONGO_URL);
 
+        //todo: database name should not be hardcoded here
         this.db = client.db('panda');//db;//Meteor.wrapAsync(mongodb.MongoClient.connect)(process.env.MONGO_URL, {});
-
-        //DB, mongo driver dependency injection, root name of gridfs collection
-        this.gfs = new grid(this.db, MongoClient, this.root);
 
         this.baseURL = options.baseURL != null ? options.baseURL : `/gridfs/${this.root}`;
 
@@ -171,6 +168,7 @@ export class FileCollection extends Mongo.Collection {
         const self = this; // Necessary in the method definition below
 
         //# Remove method override for this server-side collection
+        //Todo, this will probably need to be changed to removeasync
         Meteor.server.method_handlers[`${this._prefix}remove`] = function (selector) {
             check(selector, Object);
 
@@ -180,9 +178,10 @@ export class FileCollection extends Mongo.Collection {
 
             const cursor = self.find(selector);
 
-            if (cursor.count() > 1) {
-                throw new Meteor.Error(500, "Remote remove selector targets multiple files.\nSee https://github.com/vsivsi/meteor-file-collection/issues/152#issuecomment-278824127");
-            }
+            //Todo reimplement this check for safety, sync count is no longer available.
+            /*            if (cursor.count() > 1) {
+                            throw new Meteor.Error(500, "Remote remove selector targets multiple files.\nSee https://github.com/vsivsi/meteor-file-collection/issues/152#issuecomment-278824127");
+                        }*/
 
             const [file] = Array.from(cursor.fetch());
 
@@ -237,8 +236,10 @@ export class FileCollection extends Mongo.Collection {
     insert(file, callback) {
 
         //Create a stub in the 'chunksReceived' so we can keep track of progress
+        //pretty sure this never gets called during an actual upload and can be removed
         //TODO: only do this if resumable upload
-        chunksReceived[file._id.toHexString()] = new Set();
+        const chunkID = file._id.toHexString();
+        chunksReceived[chunkID] = new Set();
 
         if (file == null) {
             file = {};
@@ -312,28 +313,28 @@ export class FileCollection extends Mongo.Collection {
         if (writeStream) {
             //The finish event will occur on every chunk, we need to make sure it is the last one.
             //Trying to fire this from resumable_server.js just doesn't work.  I think only the raw db is available there.
-            writeStream.on('finish', function (retFile) {
+            writeStream.on('finish', async function () {
+                const retFile = this.gridFSFile;
+                //This superfluous, as there is a proper complete callback in resumable_server,
+                //there does not seem to be easy access to this class there though, so
                 if (retFile?.metadata._Resumable) { //todo: maybe still generate md5 for non-resumable somehow.
-                    //This superfluous, as there is a proper complete callback in resumable_server,
-                    //there does not seem to be easy access to this class there though, so
-
                     const chunkNumber = retFile.metadata._Resumable.resumableChunkNumber;
                     const totalChunks = retFile.metadata._Resumable.resumableTotalChunks;
                     const contentType = retFile.metadata._Resumable.resumableType;
                     const identifier = retFile.metadata._Resumable.resumableIdentifier;
-                    const receivedChunks = chunksReceived[identifier];
+                    if (!chunksReceived.hasOwnProperty(identifier)) chunksReceived[identifier] = new Set();
+                    const receivedChunks = chunksReceived[identifier]; //TODO check if needed
                     receivedChunks.add(chunkNumber);
                     if (receivedChunks.size === totalChunks) {
                         delete chunksReceived[identifier];
                         const targetId = new Mongo.ObjectID(identifier);
                         //We have to generate the MD5 ourselves as this functionality was removed from mongo 6
-                        let file = self.findOne({_id: targetId}); //TODO, see if this should be resumableIdentifier
-
+                        let file = await self.findOneAsync({_id: targetId}); //TODO, see if this should be resumableIdentifier
                         //Todo: move these to shared ops
                         let retries = 100;
                         const retryDelay = 100;//ms
-                        function md5WhenReady() {
-                            file = self.findOne({_id: targetId}); //TODO, see if this should be resumableIdentifier
+                        async function md5WhenReady() {
+                            file = await self.findOneAsync({_id: targetId}); //TODO, see if this should be resumableIdentifier
                             if (!file.length) {
                                 retries--;
                                 Meteor.setTimeout(() => {
@@ -341,13 +342,15 @@ export class FileCollection extends Mongo.Collection {
                                     else console.error(`Timeout waiting for upload to complete.  MD5 not generated for `)
                                 }, retryDelay);
                             } else {
-                                const stream = self.findOneStream({_id: file._id});
-                                const getMd5 = Meteor.wrapAsync(callback => {
-                                    const hash = crypto.createHash('md5'); //TODO: is options/encoding needed?
-                                    stream.pipe(hash);
-                                    hash.on('finish', () => callback(null, hash.digest('hex')));
-                                });
-                                const md5 = getMd5();
+                                const stream = await self.findOneStream({_id: file._id});
+                                const getMd5 = function () {
+                                    return new Promise(resolve => {
+                                        const hash = crypto.createHash('md5'); //TODO: is options/encoding needed?
+                                        stream.pipe(hash);
+                                        hash.on('finish', () => resolve(hash.digest('hex')));
+                                    })
+                                };
+                                const md5 = await getMd5();
 
                                 self.update(
                                     {_id: targetId}, //TODO: check type of ID
@@ -360,17 +363,20 @@ export class FileCollection extends Mongo.Collection {
                                     },
                                     null,
                                     (e, r) => {
+                                        //console.log('self.update done',r);
                                     }
                                 );
                             }
                         }
-                        md5WhenReady();
+
+                        await md5WhenReady();
                     }
                     return callback ? callback(null, retFile) : null;
                 }
             });
             writeStream.on('error', err => callback ? callback(err) : null);
             writeStream.on('close', function (error) {
+                if(error)console.error(error);
             });
 
             return writeStream;
@@ -379,23 +385,30 @@ export class FileCollection extends Mongo.Collection {
         return null;
     }
 
-    findOneStream(selector, options, callback) {
+    async findOneStream(selector, options, callback) {
         let bsonOID;
-
+       // console.log('findOneStream method called', selector);
+        let finalSelector = {};
+        //todo: accept plain string
         if (selector && selector.hasOwnProperty('_id')) {
-            bsonOID = new ObjectID(selector._id.toHexString());
+            bsonOID = selector._id.toHexString();
+            finalSelector = {_id: new ObjectId(bsonOID)}
         } else if (selector) {// if (selector.hasOwnProperty('md5')) {
-            //TODO, this can work as a normal selector
-            bsonOID = Meteor.wrapAsync(cb => {
-                this.bucket.find(selector).forEach((result) => {
-                    if (!result) return cb(`no file found for ${JSON.stringify(selector)}`);
-                    return cb(null, result._id);
-                });
-            })();
+           // console.log('using unmodified selector for findOneStream');
+            finalSelector = selector;
         } else {
-            return console.error('Please provide _id or md5 in selector');
+            return console.error('Please provide _id');
         }
-        return this.bucket.openDownloadStream(bsonOID);
+
+      //  console.log('finalSelector for findOneStream', finalSelector);
+
+        const file = await this.bucket.find(finalSelector).next();
+        if (!file) return console.error(
+            'No file found for selector',
+            JSON.stringify(selector)
+        )
+
+        return this.bucket.openDownloadStream(file._id, options);
     }
 
     //remove is no longer needed.  calling super.remove works perfectly fine, I confirmed the file data is deleted
