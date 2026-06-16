@@ -361,7 +361,7 @@ if (Meteor.isServer) {
                             let opts;
                             req.gridFS = await this.findOneAsync(lookup);
                             if (!req.gridFS) {
-                                console.log('req.gridFS not found', lookup);
+                                console.log('req.gridFS not found', lookup, this.root);
                                 res.writeHead(404, share.defaultResponseHeaders);
                                 res.end();
                                 return;

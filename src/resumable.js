@@ -446,6 +446,7 @@
           options.minFileSizeErrorCallback(file, errorCount++);
           return true;
         }
+        console.log('filesize',file.size, options);
         if (typeof (options.maxFileSize) !== 'undefined' && file.size > options.maxFileSize) {
           options.maxFileSizeErrorCallback(file, errorCount++);
           return true;
