@@ -375,7 +375,7 @@ if (Meteor.isServer) {
                             switch (req.method) {
                                 case 'HEAD':
                                 case 'GET':
-                                    if (!share.check_allow_deny.bind(this)('read', req.meteorUserId, req.gridFS)) {
+                                    if (!await share.check_allow_deny_async.bind(this)('read', req.meteorUserId, req.gridFS)) {
                                         res.writeHead(403, share.defaultResponseHeaders);
                                         res.end();
                                         return;
@@ -384,7 +384,7 @@ if (Meteor.isServer) {
                                 case 'POST':
                                 case 'PUT':
                                     req.maxUploadSize = this.maxUploadSize;
-                                    if (!(opts = share.check_allow_deny.bind(this)('write', req.meteorUserId, req.gridFS))) {
+                                    if (!(opts = await share.check_allow_deny_async.bind(this)('write', req.meteorUserId, req.gridFS))) {
                                         res.writeHead(403, share.defaultResponseHeaders);
                                         res.end();
                                         return;
@@ -406,16 +406,16 @@ if (Meteor.isServer) {
                                     }
                                     break;
                                 case 'DELETE':
-                                    if (!share.check_allow_deny.bind(this)('remove', req.meteorUserId, req.gridFS)) {
+                                    if (!await share.check_allow_deny_async.bind(this)('remove', req.meteorUserId, req.gridFS)) {
                                         res.writeHead(403, share.defaultResponseHeaders);
                                         res.end();
                                         return;
                                     }
                                     break;
                                 case 'OPTIONS': // Should there be a permission for options?
-                                    if (!share.check_allow_deny.bind(this)('read', req.meteorUserId, req.gridFS) &&
-                                        !share.check_allow_deny.bind(this)('write', req.meteorUserId, req.gridFS) &&
-                                        !share.check_allow_deny.bind(this)('remove', req.meteorUserId, req.gridFS)) {
+                                    if (!await share.check_allow_deny_async.bind(this)('read', req.meteorUserId, req.gridFS) &&
+                                        !await share.check_allow_deny_async.bind(this)('write', req.meteorUserId, req.gridFS) &&
+                                        !await share.check_allow_deny_async.bind(this)('remove', req.meteorUserId, req.gridFS)) {
                                         res.writeHead(403, share.defaultResponseHeaders);
                                         res.end();
                                         return;

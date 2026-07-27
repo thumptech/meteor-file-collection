@@ -34,6 +34,21 @@ if (Meteor.isServer) {
         return !checkRules(this.denys) && checkRules(this.allows);
     };
 
+    share.check_allow_deny_async = async function(type, userId, file, fields) {
+
+        const checkRules = async function(rules) {
+            let res = false;
+            for (let func of Array.from(rules[type])) {
+                if (!res) {
+                    res = await func(userId, file, fields);
+                }
+            }
+            return res;
+        };
+
+        return !await checkRules(this.denys) && await checkRules(this.allows);
+    };
+
     share.bind_env = function(func) {
         if (func != null) {
             return Meteor.bindEnvironment(func, function(err) { throw err; });
