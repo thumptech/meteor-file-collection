@@ -335,6 +335,10 @@ export class FileCollection extends Mongo.Collection {
                         const retryDelay = 100;//ms
                         async function md5WhenReady() {
                             file = await self.findOneAsync({_id: targetId}); //TODO, see if this should be resumableIdentifier
+                            if (!file) {
+                                console.warn(`Upload placeholder ${identifier} disappeared before MD5 generation`);
+                                return;
+                            }
                             if (!file.length) {
                                 retries--;
                                 Meteor.setTimeout(() => {
